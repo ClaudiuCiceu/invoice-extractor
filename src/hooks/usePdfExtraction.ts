@@ -65,25 +65,6 @@ export interface ProcessingState {
   invoices: ExtractedInvoice[];
 }
 
-function createEmptyInvoice(): ExtractedInvoice {
-  return {
-    data: '',
-    nrFf: '',
-    denumire: '',
-    cif: '',
-    totalValInclTva: '',
-    cumpScutite: '',
-    baza21: '0',
-    tva21: '0',
-    baza19: '0',
-    tva19: '0',
-    baza11: '0',
-    tva11: '0',
-    baza9: '0',
-    tva9: '0',
-  };
-}
-
 function mergeInvoiceData(base: ExtractedInvoice, incoming: ExtractedInvoice): ExtractedInvoice {
   const preferIncomingTotal = Boolean(incoming.totalValInclTva);
 
@@ -105,22 +86,35 @@ function mergeInvoiceData(base: ExtractedInvoice, incoming: ExtractedInvoice): E
   };
 }
 
-function hasAnyInvoiceSignal(invoice: ExtractedInvoice): boolean {
-  return Boolean(
-    invoice.nrFf
-    || invoice.totalValInclTva
-    || invoice.data
-    || invoice.cif
-    || invoice.denumire
-  );
-}
-
 function getInvoiceKey(invoice: ExtractedInvoice, fallbackCounter: number): string {
   if (invoice.nrFf) {
     return `NR:${invoice.nrFf.trim().toUpperCase()}`;
   }
 
   return `FB:${invoice.data}|${invoice.cif}|${invoice.totalValInclTva}|${fallbackCounter}`;
+}
+
+function extractPageText(textContent: unknown): string {
+  if (!textContent || typeof textContent !== 'object') {
+    return '';
+  }
+
+  const items = (textContent as { items?: Array<{ str?: string; hasEOL?: boolean } | null | undefined> }).items;
+  if (!Array.isArray(items)) {
+    return '';
+  }
+
+  const parts: string[] = [];
+
+  for (const item of items) {
+    if (item && typeof item.str === 'string' && item.str.length > 0) {
+      parts.push(item.str);
+    }
+
+    parts.push(item?.hasEOL ? '\n' : ' ');
+  }
+
+  return parts.join('').replace(/[\t\x0B\f\r ]+/g, ' ').replace(/ *\n */g, '\n').trim();
 }
 
 export function usePdfExtraction() {
@@ -166,44 +160,85 @@ export function usePdfExtraction() {
         throw new Error('PDF.js returned an invalid document object.');
       }
 
-      const finalizedInvoices = new Map<string, ExtractedInvoice>();
       const totalPages = pdf.numPages;
-      let currentInvoice = createEmptyInvoice();
+      const pageTexts: string[] = [];
+      const finalizedInvoices = new Map<string, ExtractedInvoice>();
       let fallbackKeyCounter = 0;
 
-      const splitIntoInvoiceSegments = (pageText: string): string[] => {
-        const normalized = pageText.replace(/\s+/g, ' ').trim();
-        if (!normalized) {
-          return [];
+      const extractInvoiceSeriesKey = (text: string): string => {
+        const invoiceData = extractInvoiceData(text);
+
+        const nrFf = invoiceData.nrFf.trim().toUpperCase();
+        const data = invoiceData.data.trim();
+        const cif = invoiceData.cif.trim().toUpperCase();
+        const total = invoiceData.totalValInclTva.trim();
+
+        if (nrFf) {
+          return [`NR:${nrFf}`, data ? `D:${data}` : '', total ? `T:${total}` : '', cif ? `C:${cif}` : '']
+            .filter(Boolean)
+            .join('|');
         }
 
-        const headerRegex = /\b(?:FURNIZOR|PRESTATOR|EMITENT)\b/gi;
-        const headerMatches = Array.from(normalized.matchAll(headerRegex));
-
-        if (headerMatches.length <= 1) {
-          return [normalized];
+        if (data && total) {
+          return `FB:${data}|${cif}|${total}`;
         }
 
-        const segments: string[] = [];
-        let start = 0;
+        if (data && cif) {
+          return `FB:${data}|${cif}`;
+        }
 
-        for (const match of headerMatches) {
-          const idx = match.index ?? 0;
-          if (idx > start) {
-            const chunk = normalized.slice(start, idx).trim();
-            if (chunk) {
-              segments.push(chunk);
-            }
+        return '';
+      };
+
+      const groupPagesIntoInvoiceChunks = (pages: string[]): string[] => {
+        const chunks: string[] = [];
+        let currentPages: string[] = [];
+        let currentSeriesKey = '';
+
+        const looksLikeInvoiceStart = (text: string): boolean => {
+          const topRegion = text.slice(0, Math.min(text.length, 1400));
+          const hasInvoiceTitle = /\bFACTUR[ĂA]\b/i.test(topRegion);
+          const hasHeaderMetadata = /\b(?:Serie\s*(?:si|și)\s*num[ăa]r|Nr\.?\s*factur[ăa]|Factura\s*nr\.?|Data\s*emiterii|Data\s*facturii|Index\s+de\s+incarcare|Codificare\s+RO-E-Factura)\b/i.test(topRegion);
+          const hasPartyHeader = /\b(?:FURNIZOR|CLIENT|CUMPARATOR|BENEFICIAR)\b/i.test(topRegion);
+
+          return (hasInvoiceTitle && hasHeaderMetadata) || (hasHeaderMetadata && hasPartyHeader);
+        };
+
+        const flushCurrentChunk = () => {
+          if (currentPages.length === 0) {
+            return;
           }
-          start = idx;
+
+          const chunk = currentPages.join('\n---PAGE_BREAK---\n').trim();
+          if (chunk) {
+            chunks.push(chunk);
+          }
+
+          currentPages = [];
+          currentSeriesKey = '';
+        };
+
+        for (const pageText of pages) {
+          const pageSeriesKey = extractInvoiceSeriesKey(pageText);
+          const startsNewInvoice = currentPages.length > 0
+            && looksLikeInvoiceStart(pageText)
+            && Boolean(pageSeriesKey)
+            && Boolean(currentSeriesKey)
+            && pageSeriesKey !== currentSeriesKey;
+
+          if (startsNewInvoice) {
+            flushCurrentChunk();
+          }
+
+          if (!currentSeriesKey && pageSeriesKey) {
+            currentSeriesKey = pageSeriesKey;
+          }
+
+          currentPages.push(pageText);
         }
 
-        const tail = normalized.slice(start).trim();
-        if (tail) {
-          segments.push(tail);
-        }
-
-        return segments.length > 0 ? segments : [normalized];
+        flushCurrentChunk();
+        return chunks;
       };
 
       const storeInvoice = (invoice: ExtractedInvoice) => {
@@ -225,16 +260,36 @@ export function usePdfExtraction() {
         finalizedInvoices.set(key, { ...invoice });
       };
 
-      const finalizeCurrentInvoice = () => {
-        if (!hasAnyInvoiceSignal(currentInvoice)) {
-          return;
+      const mergeAdjacentSplitInvoices = (invoices: ExtractedInvoice[]): ExtractedInvoice[] => {
+        const merged: ExtractedInvoice[] = [];
+
+        const hasCoreIdentity = (invoice: ExtractedInvoice): boolean => Boolean(invoice.nrFf || invoice.denumire || invoice.cif);
+        const hasTotal = (invoice: ExtractedInvoice): boolean => Boolean(invoice.totalValInclTva);
+
+        for (const current of invoices) {
+          const previous = merged[merged.length - 1];
+          if (!previous) {
+            merged.push({ ...current });
+            continue;
+          }
+
+          const sameDate = Boolean(previous.data) && Boolean(current.data) && previous.data === current.data;
+          const sameCif = Boolean(previous.cif) && Boolean(current.cif) && previous.cif === current.cif;
+          const oneMissingTotal = hasTotal(previous) !== hasTotal(current);
+          const oneMissingIdentity = hasCoreIdentity(previous) !== hasCoreIdentity(current);
+
+          if (sameDate && (sameCif || oneMissingIdentity) && oneMissingTotal) {
+            merged[merged.length - 1] = mergeInvoiceData(previous, current);
+            continue;
+          }
+
+          merged.push({ ...current });
         }
 
-        storeInvoice(currentInvoice);
-        currentInvoice = createEmptyInvoice();
+        return merged;
       };
 
-      // Process each page
+      // Read all pages first, then group them into invoice-sized chunks.
       for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
         stage = `reading page ${pageNum}`;
         const page = await pdf.getPage(pageNum);
@@ -244,68 +299,38 @@ export function usePdfExtraction() {
 
         stage = `extracting text on page ${pageNum}`;
         const textContent = await page.getTextContent();
-        if (!textContent || !Array.isArray(textContent.items)) {
-          throw new Error(`Text content on page ${pageNum} is missing or malformed.`);
-        }
-
-        // Extract text from page
-        const textItems = textContent.items as Array<{ str?: string } | null | undefined>;
-        const text = textItems
-          .map((item) => (item && typeof item.str === 'string' ? item.str : ''))
-          .join(' ');
-        const normalizedPageText = text.replace(/\s+/g, ' ').trim();
-        const segments = splitIntoInvoiceSegments(normalizedPageText);
-
-        console.log(`[PDF][page ${pageNum}] raw text:`, text);
-
-        for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
-          const segment = segments[segmentIndex];
-          const hasHeaderMarker = /\b(FURNIZOR|PRESTATOR|EMITENT)\b/i.test(segment);
-          const hasTotalMarker = /\bTOTAL\s+(?:DE\s+PLAT[ĂA]|FACTUR[ĂA]|GENERAL)\b/i.test(segment);
-
-          stage = `extracting fields on page ${pageNum}, segment ${segmentIndex + 1}`;
-          const invoiceData = extractInvoiceData(segment);
-          console.log(`[PDF][page ${pageNum}][segment ${segmentIndex + 1}] parsed fields:`, invoiceData);
-
-          const startsAnotherInvoice = hasHeaderMarker
-            && Boolean(currentInvoice.nrFf)
-            && Boolean(invoiceData.nrFf)
-            && currentInvoice.nrFf !== invoiceData.nrFf;
-
-          if (startsAnotherInvoice) {
-            console.log(`[PDF][page ${pageNum}] New invoice boundary detected. Finalizing previous invoice:`, currentInvoice);
-            finalizeCurrentInvoice();
-          }
-
-          if (!hasAnyInvoiceSignal(currentInvoice) && !hasAnyInvoiceSignal(invoiceData)) {
-            continue;
-          }
-
-          currentInvoice = mergeInvoiceData(currentInvoice, invoiceData);
-
-          const invoiceCompleted = hasTotalMarker || Boolean(invoiceData.totalValInclTva);
-          if (invoiceCompleted && isInvoiceDataValid(currentInvoice)) {
-            console.log(`[PDF][page ${pageNum}] finalized invoice:`, currentInvoice);
-            finalizeCurrentInvoice();
-          }
+        const pageText = extractPageText(textContent);
+        if (pageText) {
+          pageTexts.push(pageText);
+          console.log(`[PDF][page ${pageNum}] raw text:`, pageText);
         }
 
         // Update progress
-        const progress = Math.round((pageNum / totalPages) * 100);
+        const progress = Math.round((pageNum / totalPages) * 70);
         setState(prev => ({
           ...prev,
           progress,
-          invoices: Array.from(finalizedInvoices.values()).map((invoice, index) => ({
-            ...invoice,
-            nrCrt: index + 1,
-          })),
         }));
       }
 
-      // Flush the trailing invoice that might span to the end of the document.
-      finalizeCurrentInvoice();
+      const invoiceChunks = groupPagesIntoInvoiceChunks(pageTexts);
 
-      const invoices = Array.from(finalizedInvoices.values()).map((invoice, index) => ({
+      for (let chunkIndex = 0; chunkIndex < invoiceChunks.length; chunkIndex++) {
+        stage = `extracting invoice chunk ${chunkIndex + 1}`;
+        const chunk = invoiceChunks[chunkIndex];
+        const invoiceData = extractInvoiceData(chunk);
+        console.log(`[PDF][chunk ${chunkIndex + 1}] parsed fields:`, invoiceData);
+
+        storeInvoice(invoiceData);
+
+        const progress = 70 + Math.round(((chunkIndex + 1) / Math.max(invoiceChunks.length, 1)) * 30);
+        setState(prev => ({
+          ...prev,
+          progress,
+        }));
+      }
+
+      const invoices = mergeAdjacentSplitInvoices(Array.from(finalizedInvoices.values())).map((invoice, index) => ({
         ...invoice,
         nrCrt: index + 1,
       }));
@@ -313,6 +338,7 @@ export function usePdfExtraction() {
       setState(prev => ({
         ...prev,
         isLoading: false,
+        progress: 100,
         invoices,
       }));
 

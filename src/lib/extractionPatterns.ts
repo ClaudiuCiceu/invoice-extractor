@@ -17,7 +17,7 @@ const FALLBACK_PATTERNS = {
     /(\d{2}[./]\d{2}[./]\d{4})/,
   ],
   SERIE_NR: [
-    /(?:Serie\s*(?:si|și)\s*num[ăa]r|Nr\.?\s*factur[ăa]|Factura\s*nr\.?)\s*[:\-]?\s*([A-Za-z0-9_\/-]+)/i,
+    /(?:Serie\s*(?:si|și)\s*num[ăa]r|Nr\.?\s*factur[ăa]|Factura\s*nr\.?)\s*[:\-]?\s*([A-Za-z0-9_.\/-]+)/i,
   ],
   FURNIZOR: [
     REGEX_PATTERNS.FURNIZOR_SECTION,
@@ -92,7 +92,7 @@ function isValidInvoiceNumber(value: string): boolean {
     return false;
   }
 
-  if (!/^[A-Za-z0-9_\s\/-]+$/.test(value)) {
+  if (!/^[A-Za-z0-9_.\s\/-]+$/.test(value)) {
     return false;
   }
 
@@ -103,6 +103,7 @@ function extractInvoiceNumber(text: string): string {
   const patterns = [
     /(?:Serie\s*(?:si|și)\s*num[ăa]r|Nr\.?\s*factur[ăa]|Serie)[:\s-]+(.+?)(?=\s+(?:Data|Din|Pagina|Index)\b|\n|\r|$)/gi,
     /Factura\s*nr\.?\s*[:\-]?\s*(.+?)(?=\s+(?:Data|Din|Pagina|Index)\b|\n|\r|$)/gi,
+    /\b(BTLE\.[A-Za-z0-9_.\/-]+)\b/gi,
   ];
 
   for (const pattern of patterns) {
